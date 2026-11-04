@@ -1,0 +1,13 @@
+# Python & PyInstaller build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+bin/
+*.spec
+
+# Local logs, temporary reports, and OS metadata
+czkawka_audit_raw.txt
+*.log
+.DS_Store
