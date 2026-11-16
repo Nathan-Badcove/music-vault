@@ -5,7 +5,9 @@ import json
 import shutil
 import subprocess
 import urllib.parse
+import unicodedata
 import hashlib
+import difflib
 import ctypes
 import ctypes.util
 from datetime import datetime
@@ -462,7 +464,7 @@ class MusicVaultApp(QMainWindow):
         set_btn_variant(self.btn_fetch, "accent")
         self.btn_fetch.clicked.connect(self.run_ytdlp)
 
-        self.btn_dedupe = QPushButton("2. ACOUSTIC FINGERPRINT AUDIT (25s STRICT)")
+        self.btn_dedupe = QPushButton("2. HYBRID 25s ACOUSTIC + METADATA AUDIT")
         set_btn_variant(self.btn_dedupe, "accent")
         self.btn_dedupe.clicked.connect(self.run_czkawka_audit)
 
@@ -511,10 +513,17 @@ class MusicVaultApp(QMainWindow):
 
         staging_top = QHBoxLayout()
         self.staging_status_lbl = QLabel("Staging Queue (_New_Arrivals):")
-        self.chk_autoplay = QCheckBox("Auto-Play Next Track After Sorting/Discarding")
+
+        self.staging_search_input = QLineEdit()
+        self.staging_search_input.setPlaceholderText("🔍 Search / filter _New_Arrivals tracks...")
+        self.staging_search_input.setClearButtonEnabled(True)
+        self.staging_search_input.setMinimumWidth(280)
+        self.staging_search_input.textChanged.connect(self.filter_staging_table)
+
+        self.chk_autoplay = QCheckBox("Auto-Play Next")
         self.chk_autoplay.setChecked(True)
 
-        btn_bulk_sort = QPushButton("SORT / DISCARD SELECTED ROWS...")
+        btn_bulk_sort = QPushButton("SORT / DISCARD SELECTED...")
         set_btn_variant(btn_bulk_sort, "accent")
         btn_bulk_sort.clicked.connect(self.sort_selected_staging_rows)
 
@@ -522,7 +531,7 @@ class MusicVaultApp(QMainWindow):
         btn_refresh_staging.clicked.connect(self.refresh_staging_table)
 
         staging_top.addWidget(self.staging_status_lbl)
-        staging_top.addStretch()
+        staging_top.addWidget(self.staging_search_input, stretch=1)
         staging_top.addWidget(self.chk_autoplay)
         staging_top.addWidget(btn_bulk_sort)
         staging_top.addWidget(btn_refresh_staging)
@@ -906,7 +915,7 @@ class MusicVaultApp(QMainWindow):
                 ctypes.byref(raw_ptr), ctypes.byref(size), ctypes.byref(algo), 1
             )
             if res == 1 and size.value > 0:
-                ints = [int(raw_ptr[i]) for i in range(min(120, size.value))]
+                ints = [int(raw_ptr[i]) for i in range(min(240, size.value))]
                 lib.chromaprint_dealloc(raw_ptr)
                 return ints
         except Exception:
@@ -914,26 +923,133 @@ class MusicVaultApp(QMainWindow):
         return []
 
     def raw_fingerprints_match(self, raw_a, raw_b):
-        """Ultra-fast Chromaprint 32-bit comparison using int.bit_count() so UI never lags."""
-        if not raw_a or not raw_b or len(raw_a) < 12 or len(raw_b) < 12:
+        """
+        Generalized 25-second (~200-frame) Chromaprint matcher:
+          - Masks noisy LSB compression bits (0xAAAAAAAA) to isolate dominant spectral peaks.
+          - Checks 25-second continuous alignment across sliding intro-offset windows.
+        """
+        if not raw_a or not raw_b or len(raw_a) < 20 or len(raw_b) < 20:
             return False
-        a = raw_a[:60]
-        b = raw_b[:60]
-        # Fast exact sub-fingerprint overlap check first
-        if len(set(a) & set(b)) >= 8:
+        a = raw_a[:240]
+        b = raw_b[:240]
+
+        MASK = 0xAAAAAAAA
+        coarse_a = [x & MASK for x in a if x != 0]
+        coarse_b = [x & MASK for x in b if x != 0]
+
+        # Require strong landmark overlap across the 25s window
+        if len(set(a) & set(b)) >= 12:
             return True
+        if len(set(coarse_a) & set(coarse_b)) >= 24:
+            return True
+
         min_len = min(len(a), len(b))
-        for offset in range(-4, 5):
-            diff_bits = 0
-            compared = 0
+        for offset in range(-24, 25):
+            full_matched = 0.0
+            coarse_matched = 0.0
+            compared_frames = 0
+
             for i in range(min_len):
                 j = i + offset
                 if 0 <= j < len(b):
-                    diff_bits += ((a[i] ^ b[j]) & 0xFFFFFFFF).bit_count()
-                    compared += 32
-            if compared >= 256 and (1.0 - (diff_bits / compared)) >= 0.82:
-                return True
+                    compared_frames += 1
+                    xor_full = (a[i] ^ b[j]) & 0xFFFFFFFF
+                    xor_coarse = (a[i] ^ b[j]) & MASK
+                    full_matched += 1.0 - (xor_full.bit_count() / 32.0)
+                    coarse_matched += 1.0 - (xor_coarse.bit_count() / 16.0)
+
+            # Enforce a full 25s (~195+ frame) comparison window (or full available length if legacy entry)
+            required_frames = 195 if min_len >= 200 else max(20, int(min_len * 0.85))
+            if compared_frames >= required_frames:
+                if (full_matched / compared_frames) >= 0.74:
+                    return True
+                if (coarse_matched / compared_frames) >= 0.79:
+                    return True
         return False
+
+    def build_library_metadata_index(self):
+        """Scans all playlist folders once (using persistent cache) to cross-reference Title, Artist, Genre, Album & Duration."""
+        audio_exts = (".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav")
+        index = []
+        if not os.path.exists(self.base_dir):
+            return index
+        for folder in self.get_playlist_folders():
+            f_dir = os.path.join(self.base_dir, folder)
+            if not os.path.isdir(f_dir):
+                continue
+            for fname in os.listdir(f_dir):
+                if fname.lower().endswith(audio_exts):
+                    full_p = os.path.join(f_dir, fname)
+                    meta = self.extract_full_track_metadata(full_p)
+                    index.append((folder, fname, full_p, meta))
+        self.save_metadata_cache()
+        return index
+
+    def compare_metadata_for_duplicate(self, st_meta, lib_meta, st_fname="", lib_fname=""):
+        """
+        Cross-references Core Title, Clean Title, Normalized Artist ('&'/'and' unified),
+        Duration, Genre, and Album to catch duplicates even when tags or remaster suffixes differ.
+        """
+        s_core = st_meta.get("core_title") or st_meta.get("clean_title", "")
+        l_core = lib_meta.get("core_title") or lib_meta.get("clean_title", "")
+        s_title = st_meta.get("clean_title", "")
+        l_title = lib_meta.get("clean_title", "")
+        s_art = st_meta.get("norm_artist", "")
+        l_art = lib_meta.get("norm_artist", "")
+        s_dur = float(st_meta.get("duration", 0.0))
+        l_dur = float(lib_meta.get("duration", 0.0))
+        s_gen = st_meta.get("norm_genre", "")
+        l_gen = lib_meta.get("norm_genre", "")
+        s_alb = st_meta.get("norm_album", "")
+        l_alb = lib_meta.get("norm_album", "")
+
+        both_have_dur = (s_dur > 0 and l_dur > 0)
+        dur_diff = abs(s_dur - l_dur) if both_have_dur else 0.0
+        dur_close = (not both_have_dur) or (dur_diff <= 4.0)
+        dur_moderate = (not both_have_dur) or (dur_diff <= 15.0)
+
+        same_artist = False
+        if s_art and l_art and s_art not in {"unknown", "unknownartist"} and l_art not in {"unknown", "unknownartist"}:
+            if s_art == l_art or (len(s_art) >= 4 and len(l_art) >= 4 and (s_art in l_art or l_art in s_art)):
+                same_artist = True
+        # Also check if one track's artist appears inside the other track's filename/title
+        if not same_artist:
+            s_fn_norm = re.sub(r'[^\w]', '', re.sub(r'\b(?:the|and)\b', ' ', st_fname.lower().replace('&', ' and ')))
+            l_fn_norm = re.sub(r'[^\w]', '', re.sub(r'\b(?:the|and)\b', ' ', lib_fname.lower().replace('&', ' and ')))
+            if (s_art and len(s_art) >= 5 and s_art in l_fn_norm) or (l_art and len(l_art) >= 5 and l_art in s_fn_norm):
+                same_artist = True
+
+        # 1. Exact Core Title or Clean Title Match
+        if (s_core and l_core and s_core == l_core) or (s_title and l_title and s_title == l_title):
+            matched_t = s_core or s_title
+            if same_artist and dur_moderate:
+                return f"METADATA MATCH: Artist + Title ({st_meta.get('duration_str')})"
+            if dur_close and len(matched_t) >= 5:
+                extra = []
+                if s_gen and s_gen == l_gen:
+                    extra.append("Genre")
+                if s_alb and s_alb == l_alb:
+                    extra.append("Album")
+                suffix = f" + {'/'.join(extra)}" if extra else ""
+                return f"TITLE + DURATION ({st_meta.get('duration_str')} Δ{dur_diff:.1f}s{suffix})"
+            if same_artist and len(matched_t) >= 8:
+                return f"ARTIST + EXACT TITLE ({st_meta.get('duration_str')})"
+
+        # 2. Substring Core Title containment + Same Artist or Close Duration
+        if s_core and l_core and len(s_core) >= 5 and len(l_core) >= 5:
+            if s_core in l_core or l_core in s_core:
+                if (same_artist and dur_moderate) or (dur_diff <= 2.5 and both_have_dur):
+                    return f"TITLE MATCH + {'ARTIST' if same_artist else 'DURATION'} ({st_meta.get('duration_str')})"
+
+        # 3. Fuzzy Similarity + Artist / Duration
+        if s_core and l_core:
+            ratio = difflib.SequenceMatcher(None, s_core, l_core).ratio()
+            if same_artist and ratio >= 0.72 and dur_moderate:
+                return f"ARTIST + FUZZY TITLE ({int(ratio*100)}%) ({st_meta.get('duration_str')})"
+            if ratio >= 0.86 and dur_close:
+                return f"HIGH TITLE SIMILARITY ({int(ratio*100)}%) + DURATION ({st_meta.get('duration_str')})"
+
+        return None
 
     def check_if_discarded(self, filepath, compute_if_missing=False):
         db = self.load_discard_db()
@@ -942,14 +1058,22 @@ class MusicVaultApp(QMainWindow):
 
         fname = os.path.basename(filepath)
         norm_name = re.sub(r'[^\w]', '', os.path.splitext(fname)[0].lower())
+        st_meta = self.extract_full_track_metadata(filepath)
+        s_clean_title = st_meta.get("clean_title", "")
+        s_dur = float(st_meta.get("duration", 0.0))
 
-        # 1. Fast normalized filename check
+        # 1. Fast filename & metadata/duration check against discarded_db.json
         for entry in db:
-            saved_norm = re.sub(r'[^\w]', '', os.path.splitext(entry.get("filename", ""))[0].lower())
+            saved_fname = entry.get("filename", "")
+            saved_norm = re.sub(r'[^\w]', '', os.path.splitext(saved_fname)[0].lower())
             if norm_name and saved_norm and norm_name == saved_norm:
                 return entry
+            saved_dur = float(entry.get("duration", 0.0))
+            if s_clean_title and len(s_clean_title) >= 5 and saved_norm:
+                if s_clean_title in saved_norm and s_dur > 0 and saved_dur > 0 and abs(s_dur - saved_dur) <= 2.5:
+                    return entry
 
-        # 2. Acoustic Chromaprint check (decodes legacy base64 entries on the fly if raw_fingerprint is missing!)
+        # 2. 25s Coarse Spectral Chromaprint check
         if compute_if_missing or filepath in self.staging_fingerprint_cache:
             fp, dur, raw_ints = self.compute_fingerprint(filepath)
             if not raw_ints and fp:
@@ -961,14 +1085,13 @@ class MusicVaultApp(QMainWindow):
                 saved_fp = entry.get("fingerprint", "")
                 saved_raw = entry.get("raw_fingerprint", [])
 
-                # Automatically backfill raw_fingerprint on older discarded_db.json entries!
                 if not saved_raw and saved_fp:
                     saved_raw = self.decode_base64_fingerprint_to_raw(saved_fp)
                     if saved_raw:
                         entry["raw_fingerprint"] = saved_raw
                         db_updated = True
 
-                if fp and saved_fp and (fp == saved_fp or (len(fp) > 40 and fp[:40] == saved_fp[:40])):
+                if fp and saved_fp and (fp == saved_fp or (len(fp) > 36 and fp[:36] == saved_fp[:36])):
                     matched_entry = entry
                     break
                 if raw_ints and saved_raw and self.raw_fingerprints_match(raw_ints, saved_raw):
@@ -1100,12 +1223,36 @@ class MusicVaultApp(QMainWindow):
     # =========================================================================
     # Interactive Staging & Multi-Folder Sorter (_New_Arrivals)
     # =========================================================================
+    def get_existing_m3u8_stems_map(self):
+        """Returns {nfc_stem: full_m3u8_path} for all existing playlists with Unicode NFC normalization."""
+        m3u_dir = self.get_m3u_directory()
+        stems_map = {}
+        if os.path.exists(m3u_dir):
+            for f in sorted(os.listdir(m3u_dir)):
+                if f.lower().endswith((".m3u8", ".m3u", ".pls", ".xspf")):
+                    stem = unicodedata.normalize("NFC", os.path.splitext(f)[0].strip())
+                    if "dump" in stem.lower():
+                        continue
+                    stems_map[stem] = os.path.join(m3u_dir, f)
+        return stems_map
+
+    def is_loose_dump_folder(self, folder_name, stems_map=None):
+        if "dump" in folder_name.lower():
+            return True
+        if stems_map is None:
+            stems_map = self.get_existing_m3u8_stems_map()
+        norm_f = unicodedata.normalize("NFC", folder_name.strip())
+        return norm_f not in stems_map and folder_name.strip() not in stems_map
+
     def get_playlist_folders(self):
         if not os.path.exists(self.base_dir):
             return []
+        stems_map = self.get_existing_m3u8_stems_map()
         return sorted([
             d for d in os.listdir(self.base_dir)
-            if os.path.isdir(os.path.join(self.base_dir, d)) and d not in SYSTEM_FOLDERS
+            if os.path.isdir(os.path.join(self.base_dir, d))
+            and d not in SYSTEM_FOLDERS
+            and not self.is_loose_dump_folder(d, stems_map)
         ])
 
     def on_background_fp_scanned(self, filepath, fp_data):
@@ -1115,15 +1262,14 @@ class MusicVaultApp(QMainWindow):
         if not discard_match:
             return
 
-        # Update the row in real time if it matched a discarded fingerprint!
         for r in range(self.staging_table.rowCount()):
             item_name = self.staging_table.item(r, 0)
             if item_name and item_name.data(Qt.UserRole) == filepath:
                 reason_txt = discard_match.get("reason", "Unspecified")
                 orig_name = discard_match.get("filename", "")
                 date_txt = discard_match.get("timestamp", "")
-                status_str = f"⚠️ BLACKLIST FINGERPRINT MATCH ({orig_name} | {date_txt}): {reason_txt}"
-                item_status = self.staging_table.item(r, 1)
+                status_str = f"⚠️ BLACKLIST FINGERPRINT ({orig_name} | {date_txt}): {reason_txt}"
+                item_status = self.staging_table.item(r, 4)
                 if item_status:
                     item_status.setText(status_str)
                     warn_color = QBrush(QColor("#ff2a54"))
@@ -1133,6 +1279,30 @@ class MusicVaultApp(QMainWindow):
 
     def refresh_staging_table(self):
         staging = os.path.join(self.base_dir, "_New_Arrivals")
+        if self.staging_table.columnCount() != 8:
+            self.staging_table.setColumnCount(8)
+            self.staging_table.setHorizontalHeaderLabels([
+                "Track Filename",
+                "Artist",
+                "Album / Genre",
+                "Duration",
+                "Vault & Blacklist Status",
+                "Size",
+                "Preview",
+                "Action"
+            ])
+            hdr = self.staging_table.horizontalHeader()
+            hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+            hdr.setSectionResizeMode(1, QHeaderView.Interactive)
+            hdr.setSectionResizeMode(2, QHeaderView.Interactive)
+            hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+            hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(7, QHeaderView.ResizeToContents)
+            self.staging_table.setColumnWidth(1, 165)
+            self.staging_table.setColumnWidth(2, 175)
+
         self.staging_table.setRowCount(0)
         if not os.path.exists(staging):
             self.staging_status_lbl.setText("Staging Queue: _New_Arrivals folder not created yet.")
@@ -1143,14 +1313,26 @@ class MusicVaultApp(QMainWindow):
             if f.lower().endswith((".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav"))
         ])
 
+        lib_index = self.build_library_metadata_index()
         uncached_paths = []
         flagged_count = 0
+        lib_dupe_count = 0
+
         for fname in files:
             fpath = os.path.join(staging, fname)
             size_mb = os.path.getsize(fpath) / (1024 * 1024)
+            meta = self.extract_full_track_metadata(fpath)
             discard_match = self.check_if_discarded(fpath, compute_if_missing=False)
             if fpath not in self.staging_fingerprint_cache:
                 uncached_paths.append(fpath)
+
+            lib_match_info = None
+            if not discard_match:
+                for lib_folder, lib_fname, lib_full_p, lib_meta in lib_index:
+                    m_reason = self.compare_metadata_for_duplicate(meta, lib_meta, fname, lib_fname)
+                    if m_reason:
+                        lib_match_info = (lib_folder, lib_fname, m_reason)
+                        break
 
             row = self.staging_table.rowCount()
             self.staging_table.insertRow(row)
@@ -1158,41 +1340,76 @@ class MusicVaultApp(QMainWindow):
             item_name = QTableWidgetItem(fname)
             item_name.setData(Qt.UserRole, fpath)
 
+            artist_str = meta.get("artist") or "Unknown Artist"
+            alb = meta.get("album", "").strip()
+            gen = meta.get("genre", "").strip()
+            if alb and gen:
+                alb_gen_str = f"{gen} • {alb}"
+            elif gen:
+                alb_gen_str = gen
+            elif alb:
+                alb_gen_str = alb
+            else:
+                alb_gen_str = "—"
+
+            item_artist = QTableWidgetItem(artist_str)
+            item_artist.setForeground(QBrush(QColor("#c5c6c7")))
+
+            item_alb_gen = QTableWidgetItem(alb_gen_str)
+            item_alb_gen.setForeground(QBrush(QColor("#8892b0")))
+
+            item_dur = QTableWidgetItem(meta.get("duration_str", "--:--"))
+            item_dur.setTextAlignment(Qt.AlignCenter)
+
             if discard_match:
                 flagged_count += 1
                 reason_txt = discard_match.get("reason", "Unspecified")
                 date_txt = discard_match.get("timestamp", "")
-                status_str = f"⚠️ PREVIOUSLY DISCARDED ({date_txt}): {reason_txt}"
+                status_str = f"🚫 DISCARDED ({date_txt}): {reason_txt}"
                 item_status = QTableWidgetItem(status_str)
                 warn_color = QBrush(QColor("#ff2a54"))
                 item_name.setForeground(warn_color)
                 item_status.setForeground(warn_color)
+            elif lib_match_info:
+                lib_dupe_count += 1
+                l_folder, l_fname, l_reason = lib_match_info
+                status_str = f"⚠️ IN LIBRARY [{l_folder}]: {l_reason}"
+                item_status = QTableWidgetItem(status_str)
+                dupe_color = QBrush(QColor("#ffb86c"))
+                item_name.setForeground(dupe_color)
+                item_status.setForeground(dupe_color)
             else:
                 item_status = QTableWidgetItem("✔ Clean / Ready to Sort")
                 item_status.setForeground(QBrush(QColor("#45a29e")))
 
             self.staging_table.setItem(row, 0, item_name)
-            self.staging_table.setItem(row, 1, item_status)
-            self.staging_table.setItem(row, 2, QTableWidgetItem(f"{size_mb:.2f} MB"))
+            self.staging_table.setItem(row, 1, item_artist)
+            self.staging_table.setItem(row, 2, item_alb_gen)
+            self.staging_table.setItem(row, 3, item_dur)
+            self.staging_table.setItem(row, 4, item_status)
+            self.staging_table.setItem(row, 5, QTableWidgetItem(f"{size_mb:.2f} MB"))
 
             btn_play = QPushButton("▶ Preview")
             set_btn_variant(btn_play, "accent")
             btn_play.clicked.connect(
                 lambda _, p=fpath, b=btn_play: self.play_from_table(self.staging_table, b, p, "[STAGING]")
             )
-            self.staging_table.setCellWidget(row, 3, btn_play)
+            self.staging_table.setCellWidget(row, 6, btn_play)
 
             btn_sort = QPushButton("SORT / DISCARD ▾")
             set_btn_variant(btn_sort, "restore")
             btn_sort.clicked.connect(lambda _, p=fpath: self.open_sort_modal([p]))
-            self.staging_table.setCellWidget(row, 4, btn_sort)
+            self.staging_table.setCellWidget(row, 7, btn_sort)
 
+        self.save_metadata_cache()
         self.staging_status_lbl.setText(
-            f"Staging Queue (_New_Arrivals): {len(files)} tracks remaining "
-            f"({flagged_count} flagged as previously discarded)."
+            f"Staging (_New_Arrivals): {len(files)} tracks "
+            f"({lib_dupe_count} in library, {flagged_count} blacklisted)."
         )
 
-        # Start non-blocking background fingerprinting for any new/renamed files in _New_Arrivals
+        if hasattr(self, "staging_search_input") and self.staging_search_input.text().strip():
+            self.filter_staging_table(self.staging_search_input.text())
+
         if uncached_paths and self.load_discard_db():
             if self.fp_worker and self.fp_worker.isRunning():
                 self.fp_worker.stop()
@@ -1201,12 +1418,54 @@ class MusicVaultApp(QMainWindow):
             self.fp_worker.file_scanned.connect(self.on_background_fp_scanned)
             self.fp_worker.start()
 
+    def filter_staging_table(self, text=""):
+        """Hides/shows rows in _New_Arrivals based on Filename, Artist, Album/Genre, Duration, or Status."""
+        if hasattr(self, "staging_search_input") and not isinstance(text, str):
+            text = self.staging_search_input.text()
+        query = (text or "").strip().lower()
+        visible_count = 0
+        total_count = self.staging_table.rowCount()
+
+        for r in range(total_count):
+            row_text_parts = []
+            for col_idx in (0, 1, 2, 3, 4):
+                it = self.staging_table.item(r, col_idx)
+                if it:
+                    row_text_parts.append(it.text().lower())
+            combined = " ".join(row_text_parts)
+            match = (not query) or all(tok in combined for tok in query.split())
+            self.staging_table.setRowHidden(r, not match)
+            if match:
+                visible_count += 1
+
+        if query:
+            self.staging_status_lbl.setText(
+                f"Staging (_New_Arrivals): Showing {visible_count} of {total_count} tracks"
+            )
+        else:
+            self.staging_status_lbl.setText(
+                f"Staging Queue (_New_Arrivals): {total_count} tracks remaining"
+            )
+
+    def remove_staging_rows_by_paths(self, removed_paths):
+        """Removes sorted/discarded rows in-place in <1ms without rebuilding the entire table or restarting threads."""
+        target_set = set(removed_paths)
+        for r in range(self.staging_table.rowCount() - 1, -1, -1):
+            item = self.staging_table.item(r, 0)
+            if item and item.data(Qt.UserRole) in target_set:
+                self.staging_table.removeRow(r)
+        current_search = self.staging_search_input.text() if hasattr(self, "staging_search_input") else ""
+        self.filter_staging_table(current_search)
+
     def sort_selected_staging_rows(self):
-        selected_rows = sorted(set(idx.row() for idx in self.staging_table.selectedIndexes()))
+        selected_rows = sorted(set(
+            idx.row() for idx in self.staging_table.selectedIndexes()
+            if not self.staging_table.isRowHidden(idx.row())
+        ))
         if not selected_rows:
             QMessageBox.information(
                 self, "No Rows Selected",
-                "Select one or more tracks in the table first (use Shift/Ctrl + Click), or click 'SORT / DISCARD ▾' on any row."
+                "Select one or more visible tracks in the table first (use Shift/Ctrl + Click), or click 'SORT / DISCARD ▾' on any row."
             )
             return
         filepaths = [
@@ -1223,12 +1482,14 @@ class MusicVaultApp(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
 
+        processed_paths = []
+
         if dlg.action_type == "discard":
-            # Separate already-blacklisted files from brand-new discards!
             already_blacklisted = []
             brand_new_discards = []
             for fp in filepaths:
-                if self.check_if_discarded(fp, compute_if_missing=True):
+                # Use cached fingerprint first so UI doesn't block on large selections
+                if self.check_if_discarded(fp, compute_if_missing=(len(filepaths) <= 3)):
                     already_blacklisted.append(fp)
                 else:
                     brand_new_discards.append(fp)
@@ -1246,15 +1507,15 @@ class MusicVaultApp(QMainWindow):
                     return
                 clean_reason = reason.strip() if reason.strip() else "Manually discarded by user"
 
-            # Purge already-blacklisted files immediately without re-prompting or duplicating DB!
             for fp in already_blacklisted:
                 self.record_and_delete_discarded(fp, reason=None)
+                processed_paths.append(fp)
 
-            # Record & delete brand-new discards
             for fp in brand_new_discards:
                 self.record_and_delete_discarded(fp, reason=clean_reason)
+                processed_paths.append(fp)
 
-            self.refresh_staging_table()
+            self.remove_staging_rows_by_paths(processed_paths)
             self.refresh_discarded_table()
             self.trigger_autoplay_next()
 
@@ -1262,15 +1523,22 @@ class MusicVaultApp(QMainWindow):
             target_folders = dlg.selected_folders
             for fp in filepaths:
                 if not os.path.exists(fp):
+                    processed_paths.append(fp)
                     continue
                 fname = os.path.basename(fp)
 
-                discard_match = self.check_if_discarded(fp, compute_if_missing=True)
+                # Fast non-blocking check against cache/filename
+                discard_match = self.check_if_discarded(fp, compute_if_missing=False)
                 if discard_match:
                     ans = QMessageBox.warning(
                         self,
                         "⚠️ Previously Discarded Track Detected!",
-                        f"Track: {fname}\n\n\n"                        f"This audio matches a previously discarded file!\n\n"                        f"• Discarded On: {discard_match.get('timestamp')}\n\n"                        f"• Original Name: {discard_match.get('filename')}\n\n"                        f"• Reason: {discard_match.get('reason')}\n\n\n"                        f"Are you sure you want to proceed and add it to {target_folders}?",
+                        f"Track: {fname}\n\n"
+                        f"This audio matches a previously discarded file!\n"
+                        f"• Discarded On: {discard_match.get('timestamp')}\n"
+                        f"• Original Name: {discard_match.get('filename')}\n"
+                        f"• Reason: {discard_match.get('reason')}\n\n"
+                        f"Are you sure you want to proceed and add it to {target_folders}?",
                         QMessageBox.Yes | QMessageBox.No,
                         QMessageBox.No
                     )
@@ -1292,18 +1560,89 @@ class MusicVaultApp(QMainWindow):
                         shutil.move(fp, dest_path)
                         self.log(f"[SORT MOVE] '{fname}' -> '{folder_name}/'")
 
-            self.refresh_staging_table()
+                    self.append_sorted_track_to_m3u8_immediately(folder_name, fname)
+
+                processed_paths.append(fp)
+
+            self.remove_staging_rows_by_paths(processed_paths)
+            self.refresh_playlist_stats_table()
             self.trigger_autoplay_next()
 
     def trigger_autoplay_next(self):
         if self.chk_autoplay.isChecked() and self.staging_table.rowCount() > 0:
-            next_path = self.staging_table.item(0, 0).data(Qt.UserRole)
-            self.highlight_playing_row(self.staging_table, 0)
-            self.play_file(next_path, "[AUTO-NEXT STAGING]")
+            for r in range(self.staging_table.rowCount()):
+                if not self.staging_table.isRowHidden(r):
+                    next_path = self.staging_table.item(r, 0).data(Qt.UserRole)
+                    self.highlight_playing_row(self.staging_table, r)
+                    self.play_file(next_path, "[AUTO-NEXT STAGING]")
+                    break
 
     # =========================================================================
     # Option B: Auto-Consolidate Telegram Dump & Rebuild Relative M3Us
     # =========================================================================
+    def find_existing_m3u8_for_playlist(self, pl_name):
+        """Finds the exact .m3u8 path for pl_name using Unicode NFC normalization."""
+        m3u_dir = self.get_m3u_directory()
+        os.makedirs(m3u_dir, exist_ok=True)
+        target_nfc = unicodedata.normalize("NFC", pl_name.strip())
+        for f in sorted(os.listdir(m3u_dir)):
+            if f.lower().endswith(".m3u8"):
+                f_nfc = unicodedata.normalize("NFC", os.path.splitext(f)[0].strip())
+                if f_nfc == target_nfc:
+                    return os.path.join(m3u_dir, f)
+        return os.path.join(m3u_dir, f"{pl_name.strip()}.m3u8")
+
+    def write_clean_m3u8_file(self, m3u8_path, rel_lines):
+        """Writes an .m3u8 with #EXTINF:-1,Title headers and clean ../Folder/Track.ext relative paths."""
+        with open(m3u8_path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+            for line in rel_lines:
+                clean_rel = line.strip().replace("\\", "/")
+                if not clean_rel or clean_rel.startswith("#"):
+                    continue
+                parts = [p for p in re.split(r'[\\/]+', clean_rel) if p and p != ".."]
+                if len(parts) >= 2:
+                    folder_part, file_part = parts[-2], parts[-1]
+                    clean_rel = f"../{folder_part}/{file_part}"
+                else:
+                    file_part = parts[-1] if parts else clean_rel
+                display_title = os.path.splitext(file_part)[0]
+                f.write(f"#EXTINF:-1,{display_title}\n{clean_rel}\n")
+
+    def append_sorted_track_to_m3u8_immediately(self, folder_name, fname):
+        """Immediately splices a newly sorted track into that playlist's .m3u8 file."""
+        try:
+            m3u8_path = self.find_existing_m3u8_for_playlist(folder_name)
+            pl_folder_path = os.path.join(self.base_dir, folder_name)
+            existing_rel_lines = []
+            seen = set()
+
+            if os.path.exists(m3u8_path):
+                with open(m3u8_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for raw_line in f:
+                        s = raw_line.strip()
+                        if not s or s.startswith("#"):
+                            continue
+                        decoded = urllib.parse.unquote(s)
+                        parts = [p for p in re.split(r'[\\/]+', decoded) if p and p != ".."]
+                        if not parts:
+                            continue
+                        f_only = parts[-1]
+                        if f_only.lower() not in seen:
+                            seen.add(f_only.lower())
+                            existing_rel_lines.append(f"../{folder_name}/{f_only}")
+
+            if fname.lower() in seen:
+                return
+
+            updated_lines = self.smart_splice_playlist_tracks(
+                folder_name, pl_folder_path, existing_rel_lines, [fname], recluster_all=False
+            )
+            self.write_clean_m3u8_file(m3u8_path, updated_lines)
+            self.log(f"  [M3U8 Auto-Updated] Spliced '{fname}' into '{os.path.basename(m3u8_path)}'")
+        except Exception as e:
+            self.log(f"  [M3U8 Immediate Update Warning] {e}")
+
     def get_m3u_directory(self):
         master = os.path.join(self.base_dir, "Playlist masterfiles")
         if os.path.exists(master):
@@ -1313,24 +1652,17 @@ class MusicVaultApp(QMainWindow):
     def refresh_playlist_stats_table(self):
         if not hasattr(self, "stats_table") or not os.path.exists(self.base_dir):
             return
-        m3u_dir = self.get_m3u_directory()
         audio_exts = (".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav")
+        stems_map = self.get_existing_m3u8_stems_map()
 
         folders = [
             d for d in os.listdir(self.base_dir)
             if os.path.isdir(os.path.join(self.base_dir, d)) and d not in SYSTEM_FOLDERS
         ]
 
-        m3u8_map = {}
-        if os.path.exists(m3u_dir):
-            for f in os.listdir(m3u_dir):
-                if f.lower().endswith(".m3u8"):
-                    base = os.path.splitext(f)[0]
-                    m3u8_map[base.lower()] = os.path.join(m3u_dir, f)
-
         all_keys = sorted(
-            set(folders) | { os.path.splitext(f)[0] for f in (os.listdir(m3u_dir) if os.path.exists(m3u_dir) else []) if f.lower().endswith(".m3u8") },
-            key=lambda s: s.lower()
+            set(folders) | set(stems_map.keys()),
+            key=lambda s: (s.lower(), s)
         )
 
         self.stats_table.setRowCount(0)
@@ -1351,16 +1683,17 @@ class MusicVaultApp(QMainWindow):
                         except Exception:
                             pass
 
-            m3u8_path = m3u8_map.get(name.lower())
+            m3u8_path = stems_map.get(name.strip())
+            is_dump = self.is_loose_dump_folder(name, stems_map)
+
             m3u8_count = 0
-            if m3u8_path and os.path.exists(m3u8_path):
+            if not is_dump and m3u8_path and os.path.exists(m3u8_path):
                 try:
                     with open(m3u8_path, "r", encoding="utf-8", errors="ignore") as pf:
                         m3u8_count = sum(1 for line in pf if line.strip() and not line.strip().startswith("#"))
                 except Exception:
                     pass
 
-            is_dump = "dump" in name.lower() or name.lower() in {"telegram", "unsorted"}
             if not is_dump:
                 total_disk_tracks += len(disk_files)
                 total_m3u8_tracks += m3u8_count
@@ -1371,7 +1704,7 @@ class MusicVaultApp(QMainWindow):
 
             item_name = QTableWidgetItem(name)
             item_disk = QTableWidgetItem(str(len(disk_files)))
-            item_m3u = QTableWidgetItem(str(m3u8_count) if m3u8_path else "No .m3u8")
+            item_m3u = QTableWidgetItem("Dump / Loose Folder" if is_dump else (str(m3u8_count) if m3u8_path else "No .m3u8"))
             item_size = QTableWidgetItem(f"{folder_mb:.1f} MB")
 
             if is_dump:
@@ -1407,15 +1740,19 @@ class MusicVaultApp(QMainWindow):
         )
 
     def load_metadata_cache(self):
-        cache_p = os.path.join(self.base_dir, "_Discarded_Songs", "_metadata_cache.json")
-        if not self.metadata_cache and os.path.exists(cache_p):
+        cache_p = os.path.join(self.get_discard_dir(), "_metadata_cache.json")
+        if not getattr(self, "metadata_cache", None) and os.path.exists(cache_p):
             try:
                 with open(cache_p, "r", encoding="utf-8") as f:
                     self.metadata_cache = json.load(f)
             except Exception:
                 self.metadata_cache = {}
+        elif not hasattr(self, "metadata_cache"):
+            self.metadata_cache = {}
 
     def save_metadata_cache(self):
+        if not hasattr(self, "metadata_cache"):
+            return
         cache_p = os.path.join(self.get_discard_dir(), "_metadata_cache.json")
         try:
             with open(cache_p, "w", encoding="utf-8") as f:
@@ -1423,112 +1760,206 @@ class MusicVaultApp(QMainWindow):
         except Exception:
             pass
 
-    def get_track_grouping_signature(self, filepath):
+    def extract_full_track_metadata(self, filepath):
         """
-        Extracts normalized (artist_key, album_key, cover_hash) for Smart Playlist Splicing.
-        Uses persistent cache so 20k+ tracks only get probed once.
+        Extracts and caches full metadata for any audio file:
+        Unifies '&' and 'and', strips leading 'the', strips artist words from core_title,
+        and falls back to ffprobe if mutagen is unavailable so duration is never 0.0.
         """
         if not os.path.exists(filepath):
-            return ("", "", "")
+            return {
+                "title": "", "artist": "", "album": "", "genre": "",
+                "duration": 0.0, "duration_str": "--:--", "bitrate_kbps": 0, "cover": "",
+                "clean_title": "", "core_title": "", "norm_artist": "", "norm_album": "", "norm_genre": ""
+            }
+        self.load_metadata_cache()
         try:
             mtime = int(os.path.getmtime(filepath))
+            fsize = os.path.getsize(filepath)
         except Exception:
             mtime = 0
-        cache_key = f"{filepath}::{mtime}"
+            fsize = 0
+        cache_key = f"v32::{filepath}::{mtime}"
         if cache_key in self.metadata_cache:
-            c = self.metadata_cache[cache_key]
-            return (c.get("artist", ""), c.get("album", ""), c.get("cover", ""))
+            return self.metadata_cache[cache_key]
 
+        fname = os.path.basename(filepath)
+        fname_stem = os.path.splitext(fname)[0]
+        title = ""
         artist = ""
         album = ""
+        genre = ""
+        duration = 0.0
+        bitrate_kbps = 0
         cover_hash = ""
 
-        # Try fast mutagen extraction if installed, otherwise ffprobe
         try:
             import mutagen
             audio = mutagen.File(filepath)
-            if audio and audio.tags:
+            if audio:
+                if getattr(audio, "info", None):
+                    if getattr(audio.info, "length", 0):
+                        duration = float(audio.info.length)
+                    if getattr(audio.info, "bitrate", 0):
+                        bitrate_kbps = int(round(float(audio.info.bitrate) / 1000.0))
                 tags = audio.tags
-                # ID3 / MP4 / Vorbis tag lookups
-                for k in ("TPE1", "TPE2", "©ART", "artist", "ARTIST", "Author"):
-                    if k in tags and str(tags[k]).strip():
-                        artist = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
-                        break
-                for k in ("TALB", "©alb", "album", "ALBUM"):
-                    if k in tags and str(tags[k]).strip():
-                        album = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
-                        break
-                # Check embedded cover art bytes for matching album covers
-                for k in tags.keys():
-                    if k.startswith("APIC") or k == "covr":
-                        pic = tags[k]
-                        raw_bytes = getattr(pic, "data", None) or (bytes(pic[0]) if isinstance(pic, list) and pic else None)
-                        if raw_bytes:
-                            cover_hash = hashlib.md5(raw_bytes[:4096]).hexdigest()[:12]
+                if tags:
+                    for k in ("TIT2", "©nam", "title", "TITLE"):
+                        if k in tags and str(tags[k]).strip():
+                            title = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
                             break
+                    for k in ("TPE1", "TPE2", "©ART", "artist", "ARTIST", "Author"):
+                        if k in tags and str(tags[k]).strip():
+                            artist = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
+                            break
+                    for k in ("TALB", "©alb", "album", "ALBUM"):
+                        if k in tags and str(tags[k]).strip():
+                            album = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
+                            break
+                    for k in ("TCON", "©gen", "genre", "GENRE"):
+                        if k in tags and str(tags[k]).strip():
+                            genre = str(tags[k][0] if isinstance(tags[k], list) else tags[k]).strip()
+                            break
+                    for k in tags.keys():
+                        if k.startswith("APIC") or k == "covr":
+                            pic = tags[k]
+                            raw_bytes = getattr(pic, "data", None) or (bytes(pic[0]) if isinstance(pic, list) and pic else None)
+                            if raw_bytes:
+                                cover_hash = hashlib.md5(raw_bytes[:4096]).hexdigest()[:12]
+                                break
         except Exception:
             pass
 
-        if not artist and not album:
+        # Fallback to ffprobe if duration is still 0.0 (cached permanently so it only runs once per file)
+        if duration <= 0.0:
             try:
                 res = subprocess.run(
-                    [get_bin("ffprobe"), "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filepath],
+                    [get_bin("ffprobe"), "-v", "quiet", "-print_format", "json", "-show_format", filepath],
                     capture_output=True, text=True, timeout=4
                 )
                 if res.returncode == 0 and res.stdout:
-                    info = json.loads(res.stdout)
-                    fmt_tags = info.get("format", {}).get("tags", {})
-                    for k, v in fmt_tags.items():
+                    fmt = json.loads(res.stdout).get("format", {})
+                    if fmt.get("duration"):
+                        duration = float(fmt["duration"])
+                    if fmt.get("bit_rate") and not bitrate_kbps:
+                        bitrate_kbps = int(round(float(fmt["bit_rate"]) / 1000.0))
+                    t_dict = fmt.get("tags", {})
+                    for k, v in t_dict.items():
                         kl = k.lower()
-                        if kl in ("artist", "album_artist", "author") and not artist:
+                        if kl in ("title",) and not title:
+                            title = str(v).strip()
+                        elif kl in ("artist", "album_artist", "author") and not artist:
                             artist = str(v).strip()
                         elif kl == "album" and not album:
                             album = str(v).strip()
-                    for st in info.get("streams", []):
-                        if st.get("codec_type") == "video":
-                            w = st.get("width", 0)
-                            h = st.get("height", 0)
-                            dur_ts = st.get("duration_ts", 0)
-                            cover_hash = f"cov_{w}x{h}_{dur_ts}"
-                            break
+                        elif kl == "genre" and not genre:
+                            genre = str(v).strip()
             except Exception:
                 pass
 
-        # Fallback: parse "Artist - Track" from filename if ID3 artist is missing or generic "YouTube"
-        fname_stem = os.path.splitext(os.path.basename(filepath))[0]
-        if (not artist or artist.lower() in {"unknown", "various artists"}) and " - " in fname_stem:
-            artist = fname_stem.split(" - ", 1)[0].strip()
+        if not bitrate_kbps and duration > 0 and fsize > 0:
+            bitrate_kbps = int(round((fsize * 8) / (duration * 1000.0)))
 
-        # Normalize artist (take primary artist before feat./comma/semicolon)
-        norm_artist = re.split(r'\s+(?:feat\.?|ft\.?|featuring|with)\s+|[,;&/]', artist.lower())[0]
-        norm_artist = re.sub(r'[^\w]', '', norm_artist)
+        # Parse "Artist - Title" from filename if tags are missing or generic
+        if " - " in fname_stem:
+            parts = fname_stem.split(" - ", 1)
+            if not artist or artist.lower() in {"unknown", "unknown artist", "various artists", "youtube"}:
+                artist = parts[0].strip()
+            if not title:
+                title = parts[1].strip()
+        if not title:
+            title = fname_stem
+
+        # Normalize Artist: Do NOT split on '&'! Unify '&'/'+'/'and' and strip 'the'/'and' so
+        # "Siouxsie & The Banshees" and "Siouxsie and the Banshees" both -> "siouxsiebanshees"
+        artist_clean = re.sub(r'\s*-\s*topic$', '', artist, flags=re.IGNORECASE).strip()
+        primary_artist = re.split(r'\s+(?:feat\.?|ft\.?|featuring|with)\s+|[,;/]', artist_clean.lower())[0]
+        norm_artist_words = re.sub(r'[&\+]', ' and ', primary_artist)
+        norm_artist_words = re.sub(r'\b(?:the|and)\b', ' ', norm_artist_words)
+        norm_artist = re.sub(r'[^\w]', '', norm_artist_words)
+
+        # Clean Title & extract pure Core Title (with artist tokens and remaster/video noise removed)
+        noise_pat = (
+            r'\b(?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|'
+            r'lyrics?|hd|hq|4k|remastered(?:\s*\d{4})?|\d{4}\s*remaster(?:ed)?|remaster|'
+            r'single\s*version|album\s*version|radio\s*edit|extended(?:\s*mix|\s*version)?|'
+            r'original\s*mix|audio|video|explicit|clean|full\s*album|ost|soundtrack)\b'
+        )
+        raw_t = title.lower()
+        raw_t = re.sub(r'[\(\[\{][^\)\]\}]*' + noise_pat + r'[^\)\]\}]*[\)\]\}]', ' ', raw_t, flags=re.IGNORECASE)
+        raw_t = re.sub(noise_pat, ' ', raw_t, flags=re.IGNORECASE)
+        raw_t = re.sub(r'^\s*\d{1,3}[\.\-\s]+', '', raw_t)
+
+        # If title contains " - ", strip whichever side is the artist
+        if " - " in raw_t and norm_artist:
+            t_parts = raw_t.split(" - ")
+            kept_parts = []
+            for tp in t_parts:
+                tp_norm = re.sub(r'[^\w]', '', re.sub(r'\b(?:the|and)\b', ' ', tp.replace('&', ' and ')))
+                if tp_norm and (tp_norm == norm_artist or tp_norm in norm_artist or norm_artist in tp_norm):
+                    continue
+                kept_parts.append(tp)
+            if kept_parts:
+                raw_t = " ".join(kept_parts)
+
+        clean_title = re.sub(r'[^\w]', '', raw_t)
+        if not clean_title:
+            clean_title = re.sub(r'[^\w]', '', fname_stem.lower())
+
+        # Also create core_title by stripping norm_artist prefix/suffix if attached without " - "
+        core_title = clean_title
+        if norm_artist and len(norm_artist) >= 4:
+            if core_title.startswith(norm_artist) and len(core_title) > len(norm_artist) + 2:
+                core_title = core_title[len(norm_artist):]
+            elif core_title.endswith(norm_artist) and len(core_title) > len(norm_artist) + 2:
+                core_title = core_title[:-len(norm_artist)]
+
         norm_album = re.sub(r'[^\w]', '', album.lower())
+        norm_genre = re.sub(r'[^\w]', '', genre.lower())
 
-        self.metadata_cache[cache_key] = {
-            "artist": norm_artist,
-            "album": norm_album,
-            "cover": cover_hash
+        if duration > 0:
+            mins = int(round(duration)) // 60
+            secs = int(round(duration)) % 60
+            dur_str = f"{mins:02d}:{secs:02d}"
+        else:
+            dur_str = "--:--"
+
+        info = {
+            "title": title,
+            "artist": artist_clean if artist_clean else "Unknown Artist",
+            "album": album,
+            "genre": genre,
+            "duration": round(duration, 2),
+            "duration_str": dur_str,
+            "bitrate_kbps": bitrate_kbps,
+            "cover": cover_hash,
+            "clean_title": clean_title,
+            "core_title": core_title,
+            "norm_artist": norm_artist,
+            "norm_album": norm_album,
+            "norm_genre": norm_genre
         }
-        return (norm_artist, norm_album, cover_hash)
+        self.metadata_cache[cache_key] = info
+        return info
+
+    def get_track_grouping_signature(self, filepath):
+        info = self.extract_full_track_metadata(filepath)
+        return (info.get("norm_artist", ""), info.get("norm_album", ""), info.get("cover", ""))
 
     def smart_splice_playlist_tracks(self, pl_name, pl_folder_path, existing_rel_lines, new_filenames, recluster_all=False):
-        """
-        Splices each newly added track into existing_rel_lines:
-          1. Right after the last track sharing the SAME Artist + Album (or same Artist + Cover Hash).
-          2. Otherwise, right after the last track sharing the SAME Artist.
-          3. Otherwise, at the bottom of the playlist.
-        If recluster_all=True, also groups existing blocks cleanly by Artist -> Album.
-        """
+        """Splices newly added tracks right after matching Artist+Album/Cover blocks, or Artist blocks."""
         self.load_metadata_cache()
 
         def resolve_disk_path(rel_line):
             clean = rel_line.replace("\\", "/").lstrip("./")
+            parts = [p for p in re.split(r'[\\/]+', clean) if p and p != ".."]
+            if len(parts) >= 2:
+                return os.path.join(self.base_dir, parts[-2], parts[-1])
             return os.path.normpath(os.path.join(self.base_dir, clean))
 
         working_lines = list(existing_rel_lines)
 
         if recluster_all and working_lines:
-            # Group existing lines by first-seen Artist order, and within each Artist by Album/Cover
             artist_order = []
             artist_buckets = {}
             for line in working_lines:
@@ -1543,7 +1974,6 @@ class MusicVaultApp(QMainWindow):
             rebuilt = []
             for art_key in artist_order:
                 bucket = artist_buckets[art_key]
-                # Keep relative album order within the artist chunk
                 alb_order = []
                 alb_map = {}
                 for alb_k, l_str in bucket:
@@ -1555,7 +1985,6 @@ class MusicVaultApp(QMainWindow):
                     rebuilt.extend(alb_map[alb_k])
             working_lines = rebuilt
 
-        # Build signature list for working_lines
         line_sigs = [self.get_track_grouping_signature(resolve_disk_path(l)) for l in working_lines]
 
         for new_f in new_filenames:
@@ -1564,29 +1993,20 @@ class MusicVaultApp(QMainWindow):
             n_art, n_alb, n_cov = self.get_track_grouping_signature(new_full)
 
             insert_idx = None
-
             if n_art:
-                # Tier 1: Look for last track in playlist with SAME Artist AND SAME Album (or Cover Art)
                 if n_alb or n_cov:
                     for i in range(len(line_sigs) - 1, -1, -1):
                         e_art, e_alb, e_cov = line_sigs[i]
-                        if e_art == n_art:
-                            if (n_alb and e_alb == n_alb) or (n_cov and e_cov == n_cov):
-                                insert_idx = i + 1
-                                self.log(
-                                    f"  [Smart Splice: Album Match] Inserted '{new_f}' after '{os.path.basename(working_lines[i])}' in '{pl_name}.m3u8'"
-                                )
-                                break
-
-                # Tier 2: Look for last track in playlist with SAME Artist (end of that Artist's chunk)
+                        if e_art == n_art and ((n_alb and e_alb == n_alb) or (n_cov and e_cov == n_cov)):
+                            insert_idx = i + 1
+                            self.log(f"  [Smart Splice: Album Match] Inserted '{new_f}' after '{os.path.basename(working_lines[i])}' in '{pl_name}.m3u8'")
+                            break
                 if insert_idx is None:
                     for i in range(len(line_sigs) - 1, -1, -1):
                         e_art, e_alb, e_cov = line_sigs[i]
                         if e_art == n_art:
                             insert_idx = i + 1
-                            self.log(
-                                f"  [Smart Splice: Artist Block] Inserted '{new_f}' at end of '{n_art}' block after '{os.path.basename(working_lines[i])}' in '{pl_name}.m3u8'"
-                            )
+                            self.log(f"  [Smart Splice: Artist Block] Inserted '{new_f}' at end of '{n_art}' block in '{pl_name}.m3u8'")
                             break
 
             if insert_idx is not None:
@@ -1600,280 +2020,267 @@ class MusicVaultApp(QMainWindow):
         return working_lines
 
     def consolidate_and_rebuild_playlists(self):
-        m3u_dir = self.get_m3u_directory()
-        backup_dir = os.path.join(self.base_dir, "_M3U_Safety_Backup")
-        os.makedirs(m3u_dir, exist_ok=True)
-        os.makedirs(backup_dir, exist_ok=True)
+        try:
+            m3u_dir = self.get_m3u_directory()
+            backup_dir = os.path.join(self.base_dir, "_M3U_Safety_Backup")
+            os.makedirs(m3u_dir, exist_ok=True)
+            os.makedirs(backup_dir, exist_ok=True)
 
-        self.tabs.setCurrentWidget(self.console)
-        self.log(f"\n==> Starting Deep Consolidation & Pure .M3U8 Sync in '{os.path.basename(m3u_dir)}'...")
+            self.tabs.setCurrentWidget(self.console)
+            self.log(f"\n==> Starting Deep Consolidation & Pure .M3U8 Sync in '{os.path.basename(m3u_dir)}'...")
+            QApplication.processEvents()
 
-        audio_exts = (".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav")
+            audio_exts = (".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav")
 
-        # 1. Identify all dump folders vs regular playlist folders
-        dump_folders = {}
-        regular_folders = {}
-        for d in os.listdir(self.base_dir):
-            full_d = os.path.join(self.base_dir, d)
-            if os.path.isdir(full_d) and d not in SYSTEM_FOLDERS:
-                if d.lower() in {"telegram dump", "telegram dumb", "telegram", "downloads dump", "download dump", "unsorted", "dump"} or "dump" in d.lower():
-                    dump_folders[d.lower()] = d
-                else:
-                    regular_folders[d.lower()] = d
-
-        # 2. Index files in regular folders AND dump folders separately so dump files aren't masked
-        exact_index = {}         # (folder_lower, file_lower) -> (real_folder, real_file)
-        dump_file_index = {}     # file_lower -> (dump_folder_real, real_file)
-        dump_norm_index = {}     # norm_stem -> (dump_folder_real, real_file)
-        regular_file_index = {}  # file_lower -> (reg_folder_real, real_file)
-        regular_norm_index = {}  # norm_stem -> (reg_folder_real, real_file)
-
-        def norm_stem(filename):
-            stem = os.path.splitext(filename)[0].lower().strip()
-            cleaned = re.sub(r'[^\w]', '', stem)
-            return cleaned if len(cleaned) >= 3 else stem
-
-        for d_low, d_real in dump_folders.items():
-            f_path = os.path.join(self.base_dir, d_real)
-            for f in os.listdir(f_path):
-                if f.lower().endswith(audio_exts):
-                    exact_index[(d_low, f.lower())] = (d_real, f)
-                    dump_file_index[f.lower()] = (d_real, f)
-                    dump_norm_index[norm_stem(f)] = (d_real, f)
-
-        for r_low, r_real in regular_folders.items():
-            f_path = os.path.join(self.base_dir, r_real)
-            for f in os.listdir(f_path):
-                if f.lower().endswith(audio_exts):
-                    exact_index[(r_low, f.lower())] = (r_real, f)
-                    regular_file_index[f.lower()] = (r_real, f)
-                    regular_norm_index[norm_stem(f)] = (r_real, f)
-
-        # 3. Backup ALL existing playlist files (.m3u and .m3u8) before merging & stripping .m3u
-        existing_files = [
-            f for f in os.listdir(m3u_dir)
-            if f.lower().endswith((".m3u", ".m3u8", ".pls", ".xspf"))
-        ]
-        for pl_f in existing_files:
-            shutil.copy2(os.path.join(m3u_dir, pl_f), os.path.join(backup_dir, pl_f))
-        self.log(f"  [Safety Backup] Backed up {len(existing_files)} original playlist files to '_M3U_Safety_Backup/'")
-
-        # 4. Group both .m3u and .m3u8 files by playlist name so NO references in legacy .m3u are lost!
-        grouped_pl_files = {}  # pl_lower -> {"display_name": str, "files": [filenames]}
-        for f in sorted(existing_files):
-            base_name, ext = os.path.splitext(f)
-            if base_name.lower() in dump_folders:
-                continue
-            key_low = base_name.lower()
-            real_pl_name = regular_folders.get(key_low, base_name)
-            grouped_pl_files.setdefault(key_low, {"display_name": real_pl_name, "files": []})
-            grouped_pl_files[key_low]["files"].append(f)
-
-        for r_low, r_real in regular_folders.items():
-            if r_low not in grouped_pl_files:
-                grouped_pl_files[r_low] = {"display_name": r_real, "files": []}
-
-        # 5. Parse all playlist variants (.m3u8 first, then .m3u) to catch every single dump reference
-        dump_usage_map = {}   # (dump_folder_real, dump_file_real) -> list of target_pl_real
-        parsed_m3u_lines = {} # pl_real -> list of (resolved_folder, resolved_file)
-
-        for key_low, info in sorted(grouped_pl_files.items()):
-            pl_name = info["display_name"]
-            # Read .m3u8 first, then .m3u so any extra tracks in either file are preserved
-            pl_variants = sorted(info["files"], key=lambda x: 0 if x.lower().endswith(".m3u8") else 1)
-            entries = []
-            seen_in_pl = set()
-
-            for variant_file in pl_variants:
-                v_path = os.path.join(m3u_dir, variant_file)
-                if not os.path.exists(v_path):
-                    continue
-                with open(v_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#"):
-                            continue
-                        # Decode URL encodings like %20 if present
-                        decoded = urllib.parse.unquote(stripped).replace("\\", "/")
-                        parts = [p for p in decoded.split("/") if p and p != ".."]
-                        if not parts:
-                            continue
-
-                        fname = parts[-1]
-                        parent_folder = parts[-2] if len(parts) >= 2 else pl_name
-                        f_low = fname.lower()
-                        p_low = parent_folder.lower()
-                        n_stem = norm_stem(fname)
-
-                        # Priority 1: Did the line explicitly point to a dump folder, or does the file live in a dump folder?
-                        if (p_low, f_low) in exact_index:
-                            real_folder, real_file = exact_index[(p_low, f_low)]
-                        elif f_low in dump_file_index:
-                            real_folder, real_file = dump_file_index[f_low]
-                        elif n_stem in dump_norm_index:
-                            real_folder, real_file = dump_norm_index[n_stem]
-                        elif f_low in regular_file_index:
-                            real_folder, real_file = regular_file_index[f_low]
-                        elif n_stem in regular_norm_index:
-                            real_folder, real_file = regular_norm_index[n_stem]
-                        else:
-                            real_folder, real_file = pl_name, fname
-
-                        dedupe_key = real_file.lower()
-                        if dedupe_key not in seen_in_pl:
-                            seen_in_pl.add(dedupe_key)
-                            entries.append((real_folder, real_file))
-
-                        # Also check if a copy of this track is sitting in any dump folder!
-                        if real_folder.lower() in dump_folders:
-                            dump_key = (real_folder, real_file)
-                            dump_usage_map.setdefault(dump_key, [])
-                            if pl_name not in dump_usage_map[dump_key]:
-                                dump_usage_map[dump_key].append(pl_name)
-                        elif f_low in dump_file_index:
-                            dump_key = dump_file_index[f_low]
-                            dump_usage_map.setdefault(dump_key, [])
-                            if pl_name not in dump_usage_map[dump_key]:
-                                dump_usage_map[dump_key].append(pl_name)
-
-            parsed_m3u_lines[pl_name] = entries
-
-        # 6. Move/Copy all referenced tracks out of Telegram dump & Downloads dump into target folders
-        consolidated_count = 0
-        for (dump_folder, dump_file), target_playlists in dump_usage_map.items():
-            src_path = os.path.join(self.base_dir, dump_folder, dump_file)
-            if not os.path.exists(src_path):
-                continue
-
-            for idx, target_pl in enumerate(target_playlists):
-                dest_dir = os.path.join(self.base_dir, target_pl)
-                os.makedirs(dest_dir, exist_ok=True)
-                dest_path = os.path.join(dest_dir, dump_file)
-
-                if idx < len(target_playlists) - 1:
-                    if not os.path.exists(dest_path):
-                        shutil.copy2(src_path, dest_path)
-                    self.log(f"  [Consolidate Copy] '{dump_folder}/{dump_file}' -> '{target_pl}/{dump_file}'")
-                else:
-                    if not os.path.exists(dest_path):
-                        shutil.move(src_path, dest_path)
+            stems_map = self.get_existing_m3u8_stems_map()
+            dump_folders = set()
+            regular_folders = set()
+            for d in os.listdir(self.base_dir):
+                full_d = os.path.join(self.base_dir, d)
+                if os.path.isdir(full_d) and d not in SYSTEM_FOLDERS:
+                    if self.is_loose_dump_folder(d, stems_map):
+                        dump_folders.add(d)
                     else:
-                        os.remove(src_path)
-                    self.log(f"  [Consolidate Move] '{dump_folder}/{dump_file}' -> '{target_pl}/{dump_file}'")
-                consolidated_count += 1
+                        regular_folders.add(d)
 
-        # 7. Sweep Dump Folders for Redundant Stragglers (Files already present inside a regular playlist folder)
-        # Rebuild regular folder index after moves
-        current_regular_files = {}
-        current_regular_norms = {}
-        for r_low, r_real in regular_folders.items():
-            f_path = os.path.join(self.base_dir, r_real)
-            if os.path.isdir(f_path):
+            exact_index = {}
+            dump_file_index = {}
+            dump_norm_index = {}
+            regular_file_index = {}
+            regular_norm_index = {}
+
+            def norm_stem(filename):
+                stem = os.path.splitext(filename)[0].lower().strip()
+                cleaned = re.sub(r'[^\w]', '', stem)
+                return cleaned if len(cleaned) >= 3 else stem
+
+            for d_real in dump_folders:
+                f_path = os.path.join(self.base_dir, d_real)
                 for f in os.listdir(f_path):
                     if f.lower().endswith(audio_exts):
-                        current_regular_files[f.lower()] = (r_real, f)
-                        current_regular_norms[norm_stem(f)] = (r_real, f)
+                        exact_index[(d_real, f.lower())] = (d_real, f)
+                        dump_file_index[f.lower()] = (d_real, f)
+                        dump_norm_index[norm_stem(f)] = (d_real, f)
 
-        purged_stragglers = 0
-        for d_low, d_real in dump_folders.items():
-            d_path = os.path.join(self.base_dir, d_real)
-            if not os.path.isdir(d_path):
-                continue
-            for f in list(os.listdir(d_path)):
-                if not f.lower().endswith(audio_exts):
+            for r_real in regular_folders:
+                f_path = os.path.join(self.base_dir, r_real)
+                for f in os.listdir(f_path):
+                    if f.lower().endswith(audio_exts):
+                        exact_index[(r_real, f.lower())] = (r_real, f)
+                        regular_file_index[f.lower()] = (r_real, f)
+                        regular_norm_index[norm_stem(f)] = (r_real, f)
+
+            existing_files = [
+                f for f in os.listdir(m3u_dir)
+                if f.lower().endswith((".m3u", ".m3u8", ".pls", ".xspf"))
+            ]
+            for pl_f in existing_files:
+                shutil.copy2(os.path.join(m3u_dir, pl_f), os.path.join(backup_dir, pl_f))
+            self.log(f"  [Safety Backup] Backed up {len(existing_files)} original playlist files to '_M3U_Safety_Backup/'")
+
+            grouped_pl_files = {}
+            for f in sorted(existing_files):
+                base_name = unicodedata.normalize('NFC', os.path.splitext(f)[0].strip())
+                ext = os.path.splitext(f)[1]
+                if base_name in dump_folders or "dump" in base_name.lower():
                     continue
-                f_low = f.lower()
-                n_stem = norm_stem(f)
-                if f_low in current_regular_files or (n_stem and n_stem in current_regular_norms):
-                    matched_folder = current_regular_files.get(f_low, current_regular_norms.get(n_stem))[0]
-                    os.remove(os.path.join(d_path, f))
-                    purged_stragglers += 1
-                    self.log(f"  [Straggler Purged] Removed '{d_real}/{f}' (Already inside '{matched_folder}/')")
+                grouped_pl_files.setdefault(base_name, {"display_name": base_name, "files": []})
+                grouped_pl_files[base_name]["files"].append(f)
 
-        # 8. Strip legacy .m3u files and write clean UTF-8 .m3u8 files exclusively
-        stripped_m3u_count = 0
-        for f in os.listdir(m3u_dir):
-            if f.lower().endswith(".m3u") or os.path.splitext(f)[0].lower() in dump_folders:
-                os.remove(os.path.join(m3u_dir, f))
-                stripped_m3u_count += 1
+            for r_real in regular_folders:
+                if r_real not in grouped_pl_files:
+                    grouped_pl_files[r_real] = {"display_name": r_real, "files": []}
 
-        updated_count = 0
-        total_pl = max(1, len(parsed_m3u_lines))
-        for idx, (pl_name, entries) in enumerate(sorted(parsed_m3u_lines.items()), 1):
-            m3u8_filename = f"{pl_name}.m3u8"
-            m3u8_path = os.path.join(m3u_dir, m3u8_filename)
-            final_lines = []
-            seen = set()
+            dump_usage_map = {}
+            parsed_m3u_lines = {}
 
-            pl_folder_path = os.path.join(self.base_dir, pl_name)
-            folder_files_map = {}
-            if os.path.isdir(pl_folder_path):
-                for f in os.listdir(pl_folder_path):
-                    if f.lower().endswith(audio_exts):
-                        folder_files_map[f.lower()] = f
+            for pl_name, info in sorted(grouped_pl_files.items()):
+                pl_variants = sorted(info["files"], key=lambda x: 0 if x.lower().endswith(".m3u8") else 1)
+                entries = []
+                seen_in_pl = set()
 
-            # Preserve playlist order, pointing tracks to their local playlist folder
-            for real_folder, real_file in entries:
-                if real_file.lower() in folder_files_map:
-                    actual_fname = folder_files_map[real_file.lower()]
-                    effective_folder = pl_name
-                elif real_folder.lower() in dump_folders:
-                    actual_fname = real_file
-                    effective_folder = pl_name
-                else:
-                    actual_fname = real_file
-                    effective_folder = real_folder
+                for variant_file in pl_variants:
+                    v_path = os.path.join(m3u_dir, variant_file)
+                    if not os.path.exists(v_path):
+                        continue
+                    with open(v_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            stripped = line.strip()
+                            if not stripped or stripped.startswith("#"):
+                                continue
+                            decoded = urllib.parse.unquote(stripped).replace("\\", "/")
+                            parts = [p for p in re.split(r'[\\/]+', decoded) if p and p != ".."]
+                            if not parts:
+                                continue
 
-                k = (effective_folder.lower(), actual_fname.lower())
-                if k not in seen:
-                    seen.add(k)
-                    final_lines.append(f"../{effective_folder}/{actual_fname}")
+                            fname = parts[-1]
+                            parent_folder = parts[-2] if len(parts) >= 2 else pl_name
+                            f_low = fname.lower()
+                            n_stem = norm_stem(fname)
 
-            # Smart Artist & Album Cover Splicer for newly sorted tracks (and optional full re-clustering)
-            new_in_folder = 0
-            if os.path.isdir(pl_folder_path):
-                new_files_to_splice = []
-                for f in sorted(os.listdir(pl_folder_path)):
-                    if f.lower().endswith(audio_exts):
-                        k = (pl_name.lower(), f.lower())
-                        if k not in seen:
-                            seen.add(k)
-                            new_files_to_splice.append(f)
-                            new_in_folder += 1
+                            if (parent_folder, f_low) in exact_index:
+                                real_folder, real_file = exact_index[(parent_folder, f_low)]
+                            elif f_low in dump_file_index:
+                                real_folder, real_file = dump_file_index[f_low]
+                            elif n_stem in dump_norm_index:
+                                real_folder, real_file = dump_norm_index[n_stem]
+                            elif f_low in regular_file_index:
+                                real_folder, real_file = regular_file_index[f_low]
+                            elif n_stem in regular_norm_index:
+                                real_folder, real_file = regular_norm_index[n_stem]
+                            else:
+                                real_folder, real_file = pl_name, fname
 
-                if new_files_to_splice or (hasattr(self, "chk_recluster_existing") and self.chk_recluster_existing.isChecked()):
-                    final_lines = self.smart_splice_playlist_tracks(
-                        pl_name, pl_folder_path, final_lines, new_files_to_splice,
-                        recluster_all=(hasattr(self, "chk_recluster_existing") and self.chk_recluster_existing.isChecked())
-                    )
+                            dedupe_key = real_file.lower()
+                            if dedupe_key not in seen_in_pl:
+                                seen_in_pl.add(dedupe_key)
+                                entries.append((real_folder, real_file))
 
-            with open(m3u8_path, "w", encoding="utf-8") as f:
-                f.write("#EXTM3U\n")
-                for line in final_lines:
-                    f.write(f"{line}\n")
+                            if real_folder in dump_folders:
+                                dump_key = (real_folder, real_file)
+                                dump_usage_map.setdefault(dump_key, [])
+                                if pl_name not in dump_usage_map[dump_key]:
+                                    dump_usage_map[dump_key].append(pl_name)
+                            elif f_low in dump_file_index:
+                                dump_key = dump_file_index[f_low]
+                                dump_usage_map.setdefault(dump_key, [])
+                                if pl_name not in dump_usage_map[dump_key]:
+                                    dump_usage_map[dump_key].append(pl_name)
 
-            pct = int((idx / total_pl) * 100)
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(pct)
-            self.progress_bar.setFormat(f"WRITING UTF-8 .M3U8 PLAYLISTS: {idx}/{total_pl} ({pct}%)")
+                parsed_m3u_lines[pl_name] = entries
 
-            self.log(
-                f"  [M3U8 Synced] {m3u8_filename} -> {len(final_lines)} tracks "
-                f"({new_in_folder} newly added from folder)"
+            consolidated_count = 0
+            for (dump_folder, dump_file), target_playlists in dump_usage_map.items():
+                src_path = os.path.join(self.base_dir, dump_folder, dump_file)
+                if not os.path.exists(src_path):
+                    continue
+
+                for idx, target_pl in enumerate(target_playlists):
+                    dest_dir = os.path.join(self.base_dir, target_pl)
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dest_path = os.path.join(dest_dir, dump_file)
+
+                    if idx < len(target_playlists) - 1:
+                        if not os.path.exists(dest_path):
+                            shutil.copy2(src_path, dest_path)
+                        self.log(f"  [Consolidate Copy] '{dump_folder}/{dump_file}' -> '{target_pl}/{dump_file}'")
+                    else:
+                        if not os.path.exists(dest_path):
+                            shutil.move(src_path, dest_path)
+                        else:
+                            os.remove(src_path)
+                        self.log(f"  [Consolidate Move] '{dump_folder}/{dump_file}' -> '{target_pl}/{dump_file}'")
+                    consolidated_count += 1
+
+            current_regular_files = {}
+            current_regular_norms = {}
+            for r_real in regular_folders:
+                f_path = os.path.join(self.base_dir, r_real)
+                if os.path.isdir(f_path):
+                    for f in os.listdir(f_path):
+                        if f.lower().endswith(audio_exts):
+                            current_regular_files[f.lower()] = (r_real, f)
+                            current_regular_norms[norm_stem(f)] = (r_real, f)
+
+            purged_stragglers = 0
+            for d_real in dump_folders:
+                d_path = os.path.join(self.base_dir, d_real)
+                if not os.path.isdir(d_path):
+                    continue
+                for f in list(os.listdir(d_path)):
+                    if not f.lower().endswith(audio_exts):
+                        continue
+                    f_low = f.lower()
+                    n_stem = norm_stem(f)
+                    if f_low in current_regular_files or (n_stem and n_stem in current_regular_norms):
+                        matched_folder = current_regular_files.get(f_low, current_regular_norms.get(n_stem))[0]
+                        os.remove(os.path.join(d_path, f))
+                        purged_stragglers += 1
+                        self.log(f"  [Straggler Purged] Removed '{d_real}/{f}' (Already inside '{matched_folder}/')")
+
+            stripped_m3u_count = 0
+            for f in os.listdir(m3u_dir):
+                if f.lower().endswith(".m3u") or os.path.splitext(f)[0] in dump_folders:
+                    os.remove(os.path.join(m3u_dir, f))
+                    stripped_m3u_count += 1
+
+            updated_count = 0
+            total_spiced_tracks = 0
+            total_pl = max(1, len(parsed_m3u_lines))
+            for idx, (pl_name, entries) in enumerate(sorted(parsed_m3u_lines.items()), 1):
+                m3u8_path = self.find_existing_m3u8_for_playlist(pl_name)
+                m3u8_filename = os.path.basename(m3u8_path)
+                final_lines = []
+                seen_filenames = set()
+
+                pl_folder_path = os.path.join(self.base_dir, pl_name)
+                folder_files_map = {}
+                if os.path.isdir(pl_folder_path):
+                    for f in os.listdir(pl_folder_path):
+                        if f.lower().endswith(audio_exts):
+                            folder_files_map[f.lower()] = f
+
+                for real_folder, real_file in entries:
+                    if real_file.lower() in folder_files_map:
+                        actual_fname = folder_files_map[real_file.lower()]
+                        effective_folder = pl_name
+                    elif real_folder in dump_folders:
+                        actual_fname = real_file
+                        effective_folder = pl_name
+                    else:
+                        actual_fname = real_file
+                        effective_folder = real_folder
+
+                    f_key = actual_fname.lower()
+                    if f_key not in seen_filenames:
+                        seen_filenames.add(f_key)
+                        final_lines.append(f"../{effective_folder}/{actual_fname}")
+
+                new_in_folder = 0
+                if os.path.isdir(pl_folder_path):
+                    new_files_to_splice = []
+                    for f in sorted(os.listdir(pl_folder_path)):
+                        if f.lower().endswith(audio_exts):
+                            if f.lower() not in seen_filenames:
+                                seen_filenames.add(f.lower())
+                                new_files_to_splice.append(f)
+                                new_in_folder += 1
+                                total_spiced_tracks += 1
+
+                    if new_files_to_splice or (hasattr(self, "chk_recluster_existing") and self.chk_recluster_existing.isChecked()):
+                        final_lines = self.smart_splice_playlist_tracks(
+                            pl_name, pl_folder_path, final_lines, new_files_to_splice,
+                            recluster_all=(hasattr(self, "chk_recluster_existing") and self.chk_recluster_existing.isChecked())
+                        )
+
+                self.write_clean_m3u8_file(m3u8_path, final_lines)
+
+                pct = int((idx / total_pl) * 100)
+                self.progress_bar.setRange(0, 100)
+                self.progress_bar.setValue(pct)
+                self.progress_bar.setFormat(f"WRITING UTF-8 .M3U8 PLAYLISTS: {idx}/{total_pl} ({pct}%)")
+                QApplication.processEvents()
+
+                self.log(
+                    f"  [M3U8 Synced] {m3u8_filename} -> {len(final_lines)} tracks "
+                    f"({new_in_folder} newly spliced from folder)"
+                )
+                updated_count += 1
+
+            self.refresh_playlist_stats_table()
+            self.telemetry_label.setText(
+                f"TELEMETRY // SYNC COMPLETE: {updated_count} .m3u8 Playlists | +{total_spiced_tracks} New Tracks Spliced"
             )
-            updated_count += 1
-
-        self.refresh_playlist_stats_table()
-        self.telemetry_label.setText(
-            f"TELEMETRY // SYNC COMPLETE: {updated_count} .m3u8 Playlists | {stripped_m3u_count} Legacy .m3u Stripped"
-        )
-        self.log(
-            f"\n==> Completed!\n"
-            f"    • Relocated {consolidated_count} dump tracks into playlist folders\n"
-            f"    • Purged {purged_stragglers} redundant dump stragglers already in playlists\n"
-            f"    • Stripped {stripped_m3u_count} legacy .m3u files\n"
-            f"    • Synced {updated_count} clean UTF-8 .m3u8 playlists.\n"
-        )
+            self.log(
+                f"\n==> Completed!\n"
+                f"    • Spliced {total_spiced_tracks} newly sorted folder tracks into .m3u8 playlists\n"
+                f"    • Relocated {consolidated_count} dump tracks into playlist folders\n"
+                f"    • Purged {purged_stragglers} redundant dump stragglers\n"
+                f"    • Synced {updated_count} clean UTF-8 .m3u8 playlists.\n"
+            )
+        except Exception as e:
+            import traceback
+            self.log(f"\n[CONSOLIDATE ERROR] {e}\n{traceback.format_exc()}")
 
     # =========================================================================
     # Core Utilities, Downloader, Acoustic Audit & Audio Player
@@ -2433,29 +2840,145 @@ class MusicVaultApp(QMainWindow):
             "-d", staging,
             "--search-method", "CONTENT",
             "--minimum-segment-duration", "25.0",
-            "--maximum-difference", "1.5",
+            "--maximum-difference", "4.5",
             "-f", self.report_path
         ]
         self.run_cmd(get_bin("czkawka_cli"), args, mode="czkawka", on_finish=self.parse_and_quarantine_dupes)
 
     def parse_and_quarantine_dupes(self):
-        self.log("\n==> Parsing 25-second acoustic fingerprint report & scanning against Discarded Blacklist...")
+        self.log("\n==> Running Multi-Layer Audit: (1) 25s Acoustic Waveform, (2) Metadata/Duration/Artist/Genre, (3) Blacklist...")
         staging = os.path.abspath(os.path.join(self.base_dir, "_New_Arrivals"))
         quarantine = os.path.abspath(os.path.join(self.base_dir, "_Quarantined_Dupes"))
         os.makedirs(quarantine, exist_ok=True)
 
+        if self.fp_worker and self.fp_worker.isRunning():
+            self.fp_worker.stop()
+            self.fp_worker.wait(500)
+
+        # Configure 9-column Audit Report with "⇄ Replace Orig" and Quality Badges
+        if self.audit_table.columnCount() != 9:
+            self.audit_table.setColumnCount(9)
+            self.audit_table.setHorizontalHeaderLabels([
+                "Quarantined Dupe (_New_Arrivals)",
+                "Existing Library Match",
+                "Playlist Folder",
+                "Match Basis & Quality Comparison",
+                "Audition Dupe",
+                "Audition Orig",
+                "Replace Original",
+                "Restore",
+                "Delete"
+            ])
+            hdr = self.audit_table.horizontalHeader()
+            hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+            hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+            hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+            for c_i in (4, 5, 6, 7, 8):
+                hdr.setSectionResizeMode(c_i, QHeaderView.ResizeToContents)
+
         self.audit_table.setRowCount(0)
         quarantined_count = 0
+        metadata_caught_count = 0
         blacklist_caught_count = 0
 
-        # --- PART A: Parse czkawka_cli Library Duplicates (if report file exists) ---
+        def format_quality_badge(filepath):
+            if not filepath or not os.path.exists(filepath):
+                return ""
+            try:
+                sz_mb = os.path.getsize(filepath) / (1024 * 1024)
+                meta = self.extract_full_track_metadata(filepath)
+                kbps = meta.get("bitrate_kbps", 0)
+                dur_s = meta.get("duration_str", "--:--")
+                if kbps > 0:
+                    return f"[{kbps}kbps • {sz_mb:.1f}MB • {dur_s}]"
+                return f"[{sz_mb:.1f}MB • {dur_s}]"
+            except Exception:
+                return ""
+
+        def add_audit_row(fname, dest_quarantine, orig_display, folder_display, reason_display, orig_lib_path=None, is_blacklist=False):
+            row = self.audit_table.rowCount()
+            self.audit_table.insertRow(row)
+
+            q_badge = format_quality_badge(dest_quarantine)
+            o_badge = format_quality_badge(orig_lib_path) if orig_lib_path else ""
+
+            it_q = QTableWidgetItem(f"{fname}  {q_badge}".strip())
+            it_orig = QTableWidgetItem(f"{orig_display}  {o_badge}".strip())
+            it_fold = QTableWidgetItem(folder_display)
+            it_reas = QTableWidgetItem(reason_display)
+
+            if is_blacklist:
+                brush = QBrush(QColor("#ff2a54"))
+                for it in (it_q, it_orig, it_fold, it_reas):
+                    it.setForeground(brush)
+            elif "METADATA" in reason_display or "TITLE" in reason_display or "ARTIST" in reason_display or "SPECTRAL" in reason_display:
+                brush = QBrush(QColor("#ffb86c"))
+                it_reas.setForeground(brush)
+
+            self.audit_table.setItem(row, 0, it_q)
+            self.audit_table.setItem(row, 1, it_orig)
+            self.audit_table.setItem(row, 2, it_fold)
+            self.audit_table.setItem(row, 3, it_reas)
+
+            btn_play_dupe = QPushButton("▶ Dupe")
+            set_btn_variant(btn_play_dupe, "accent")
+            btn_play_dupe.clicked.connect(
+                lambda _, p=dest_quarantine, b=btn_play_dupe: self.play_from_table(
+                    self.audit_table, b, p, "[QUARANTINED DUPE]"
+                )
+            )
+            self.audit_table.setCellWidget(row, 4, btn_play_dupe)
+
+            if orig_lib_path and os.path.exists(orig_lib_path):
+                btn_play_orig = QPushButton("▶ Orig")
+                set_btn_variant(btn_play_orig, "accent")
+                btn_play_orig.clicked.connect(
+                    lambda _, p=orig_lib_path, b=btn_play_orig: self.play_from_table(
+                        self.audit_table, b, p, f"[LIBRARY: {folder_display}]"
+                    )
+                )
+                self.audit_table.setCellWidget(row, 5, btn_play_orig)
+
+                btn_replace = QPushButton("⇄ Replace Orig")
+                set_btn_variant(btn_replace, "restore")
+                btn_replace.setToolTip(f"Overwrite '{orig_display}' in '{folder_display}' with this new version")
+                btn_replace.clicked.connect(
+                    lambda _, qp=dest_quarantine, op=orig_lib_path, b=btn_replace: self.replace_original_with_quarantined(qp, op, b)
+                )
+                self.audit_table.setCellWidget(row, 6, btn_replace)
+            else:
+                lbl_deleted = QLabel("Deleted Previously")
+                lbl_deleted.setAlignment(Qt.AlignCenter)
+                lbl_deleted.setStyleSheet("color: #8892b0; font-style: italic;")
+                self.audit_table.setCellWidget(row, 5, lbl_deleted)
+
+                lbl_na = QLabel("—")
+                lbl_na.setAlignment(Qt.AlignCenter)
+                self.audit_table.setCellWidget(row, 6, lbl_na)
+
+            btn_restore = QPushButton("↩ Restore")
+            set_btn_variant(btn_restore, "restore")
+            btn_restore.clicked.connect(
+                lambda _, q_path=dest_quarantine, btn=btn_restore: self.restore_single_quarantined(q_path, btn)
+            )
+            self.audit_table.setCellWidget(row, 7, btn_restore)
+
+            btn_del_one = QPushButton("✖ Delete")
+            set_btn_variant(btn_del_one, "danger")
+            btn_del_one.clicked.connect(
+                lambda _, q_path=dest_quarantine, btn=btn_del_one: self.delete_single_quarantined(q_path, btn)
+            )
+            self.audit_table.setCellWidget(row, 8, btn_del_one)
+
+        # --- PART A: Parse czkawka_cli 25-Second Acoustic Waveform Matches (allowing apostrophes in paths!) ---
         if os.path.exists(self.report_path):
             with open(self.report_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            blocks = re.split(r'\n\s*\n', content)
+            blocks = re.split(r'\n\s*\n|----+', content)
             for block in blocks:
-                paths = re.findall(r'(/[^\n"\']+\.(?:mp3|m4a|flac|opus|ogg|wav))', block, re.IGNORECASE)
+                paths = re.findall(r'((?:[a-zA-Z]:[\\/]|/)[^\n"]+\.(?:mp3|m4a|flac|opus|ogg|wav))', block, re.IGNORECASE)
                 if len(paths) < 2:
                     continue
 
@@ -2467,144 +2990,178 @@ class MusicVaultApp(QMainWindow):
                     lib_folder = os.path.basename(os.path.dirname(orig_lib_path))
 
                     for st_file in staging_files:
+                        if not os.path.exists(st_file):
+                            continue
                         fname = os.path.basename(st_file)
                         dest_quarantine = os.path.join(quarantine, fname)
-                        if os.path.exists(st_file):
-                            shutil.move(st_file, dest_quarantine)
-                            quarantined_count += 1
-
-                        row = self.audit_table.rowCount()
-                        self.audit_table.insertRow(row)
-
-                        self.audit_table.setItem(row, 0, QTableWidgetItem(fname))
-                        self.audit_table.setItem(row, 1, QTableWidgetItem(os.path.basename(orig_lib_path)))
-                        self.audit_table.setItem(row, 2, QTableWidgetItem(lib_folder))
-                        self.audit_table.setItem(row, 3, QTableWidgetItem("25s Waveform (<=1.5)"))
-
-                        btn_play_dupe = QPushButton("▶ Dupe")
-                        set_btn_variant(btn_play_dupe, "accent")
-                        btn_play_dupe.clicked.connect(
-                            lambda _, p=dest_quarantine, b=btn_play_dupe: self.play_from_table(
-                                self.audit_table, b, p, "[QUARANTINED DUPE]"
-                            )
+                        shutil.move(st_file, dest_quarantine)
+                        quarantined_count += 1
+                        add_audit_row(
+                            fname, dest_quarantine,
+                            os.path.basename(orig_lib_path), lib_folder,
+                            "🔊 25s WAVEFORM MATCH",
+                            orig_lib_path=orig_lib_path
                         )
-                        self.audit_table.setCellWidget(row, 4, btn_play_dupe)
 
-                        btn_play_orig = QPushButton("▶ Orig")
-                        set_btn_variant(btn_play_orig, "accent")
-                        btn_play_orig.clicked.connect(
-                            lambda _, p=orig_lib_path, b=btn_play_orig: self.play_from_table(
-                                self.audit_table, b, p, f"[LIBRARY: {lib_folder}]"
-                            )
-                        )
-                        self.audit_table.setCellWidget(row, 5, btn_play_orig)
-
-                        btn_restore = QPushButton("↩ Restore")
-                        set_btn_variant(btn_restore, "restore")
-                        btn_restore.clicked.connect(
-                            lambda _, q_path=dest_quarantine, btn=btn_restore: self.restore_single_quarantined(q_path, btn)
-                        )
-                        self.audit_table.setCellWidget(row, 6, btn_restore)
-
-                        btn_del_one = QPushButton("✖ Delete")
-                        set_btn_variant(btn_del_one, "danger")
-                        btn_del_one.clicked.connect(
-                            lambda _, q_path=dest_quarantine, btn=btn_del_one: self.delete_single_quarantined(q_path, btn)
-                        )
-                        self.audit_table.setCellWidget(row, 7, btn_del_one)
-
-        # --- PART B: Deep Acoustic Fingerprint Audit Against _Discarded_Songs Blacklist ---
-        # Stop background worker first so it doesn't fight with the audit over fpcalc subprocesses
-        if self.fp_worker and self.fp_worker.isRunning():
-            self.fp_worker.stop()
-            self.fp_worker.wait(500)
-
+        # --- PART B: Deep Metadata + Duration + 25s Coarse Spectral Cross-Reference Against Library ---
         audio_exts = (".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav")
-        if os.path.exists(staging) and self.load_discard_db():
-            remaining_files = sorted([
-                f for f in os.listdir(staging) if f.lower().endswith(audio_exts)
-            ])
-            total_rem = max(1, len(remaining_files))
-            for idx_f, fname in enumerate(remaining_files, 1):
-                if idx_f % 3 == 0:
-                    pct_b = int((idx_f / total_rem) * 100)
-                    self.progress_bar.setFormat(f"CHECKING BLACKLIST FINGERPRINTS: {idx_f}/{total_rem} ({pct_b}%)")
+        if os.path.exists(staging):
+            lib_index = self.build_library_metadata_index()
+            remaining = sorted([f for f in os.listdir(staging) if f.lower().endswith(audio_exts)])
+            total_rem = max(1, len(remaining))
+
+            for idx_f, fname in enumerate(remaining, 1):
+                if idx_f % 2 == 0:
+                    pct = int((idx_f / total_rem) * 100)
+                    self.progress_bar.setFormat(f"CROSS-REFERENCING METADATA & 25s SPECTRAL FINGERPRINTS: {idx_f}/{total_rem} ({pct}%)")
                     QApplication.processEvents()
+
                 st_file = os.path.join(staging, fname)
+                if not os.path.exists(st_file):
+                    continue
+
+                # 1. Check Blacklist first
                 discard_match = self.check_if_discarded(st_file, compute_if_missing=True)
                 if discard_match:
                     dest_quarantine = os.path.join(quarantine, fname)
-                    if os.path.exists(st_file):
-                        shutil.move(st_file, dest_quarantine)
-                        blacklist_caught_count += 1
-
+                    shutil.move(st_file, dest_quarantine)
+                    blacklist_caught_count += 1
                     orig_discard_name = discard_match.get("filename", "Unknown")
                     discard_reason = discard_match.get("reason", "Previously discarded")
                     discard_date = discard_match.get("timestamp", "")
+                    self.log(f"  [BLACKLIST MATCH] '{fname}' matched '{orig_discard_name}' -> Quarantined")
+                    add_audit_row(
+                        fname, dest_quarantine,
+                        f"🚫 {orig_discard_name} ({discard_date})",
+                        "_Discarded_Songs (Blacklist)",
+                        f"BLACKLISTED: {discard_reason}",
+                        orig_lib_path=None,
+                        is_blacklist=True
+                    )
+                    continue
 
-                    self.log(
-                        f"  [BLACKLIST FINGERPRINT MATCH] '{fname}' matched discarded track '{orig_discard_name}' "
-                        f"(Reason: {discard_reason}) -> Isolated to _Quarantined_Dupes"
+                # 2. Check Library Metadata + Duration + Fuzzy Title/Artist/Genre + 25s Spectral Fallback
+                st_meta = self.extract_full_track_metadata(st_file)
+                st_dur = float(st_meta.get("duration", 0.0))
+                matched_lib = None
+
+                for lib_folder, lib_fname, lib_full_p, lib_meta in lib_index:
+                    m_reason = self.compare_metadata_for_duplicate(st_meta, lib_meta, fname, lib_fname)
+                    if m_reason:
+                        matched_lib = (lib_folder, lib_fname, lib_full_p, f"🎯 {m_reason}")
+                        break
+
+                # If metadata didn't match directly, check 25s Coarse Spectral Fingerprint on any track within ±6.0s duration!
+                if not matched_lib and st_dur > 0:
+                    raw_st = None
+                    for lib_folder, lib_fname, lib_full_p, lib_meta in lib_index:
+                        lib_dur = float(lib_meta.get("duration", 0.0))
+                        if lib_dur > 0 and abs(st_dur - lib_dur) <= 6.0:
+                            s_art = st_meta.get("norm_artist", "")
+                            l_art = lib_meta.get("norm_artist", "")
+                            s_core = st_meta.get("core_title", "")
+                            l_core = lib_meta.get("core_title", "")
+                            same_art = bool(s_art and l_art and (s_art == l_art or s_art in l_art or l_art in s_art))
+                            title_sim = difflib.SequenceMatcher(None, s_core, l_core).ratio() if (s_core and l_core) else 0.0
+                            if same_art or title_sim >= 0.35 or abs(st_dur - lib_dur) <= 1.5:
+                                if raw_st is None:
+                                    _, _, raw_st = self.compute_fingerprint(st_file)
+                                if raw_st:
+                                    _, _, raw_lib = self.compute_fingerprint(lib_full_p)
+                                    if raw_lib and self.raw_fingerprints_match(raw_st, raw_lib):
+                                        matched_lib = (
+                                            lib_folder, lib_fname, lib_full_p,
+                                            f"🔊 25s SPECTRAL + DURATION ({st_meta.get('duration_str')})"
+                                        )
+                                        break
+
+                if matched_lib:
+                    lib_folder, lib_fname, lib_full_p, reason_str = matched_lib
+                    dest_quarantine = os.path.join(quarantine, fname)
+                    shutil.move(st_file, dest_quarantine)
+                    metadata_caught_count += 1
+                    self.log(f"  [HYBRID DUPE MATCH] '{fname}' matched '{lib_folder}/{lib_fname}' ({reason_str}) -> Quarantined")
+                    add_audit_row(
+                        fname, dest_quarantine,
+                        lib_fname, lib_folder,
+                        reason_str,
+                        orig_lib_path=lib_full_p
                     )
 
-                    row = self.audit_table.rowCount()
-                    self.audit_table.insertRow(row)
-
-                    item_q = QTableWidgetItem(fname)
-                    item_orig = QTableWidgetItem(f"🚫 {orig_discard_name} ({discard_date})")
-                    item_folder = QTableWidgetItem("_Discarded_Songs (Blacklist)")
-                    item_reason = QTableWidgetItem(f"BLACKLISTED: {discard_reason}")
-
-                    warn_brush = QBrush(QColor("#ff2a54"))
-                    for it in (item_q, item_orig, item_folder, item_reason):
-                        it.setForeground(warn_brush)
-
-                    self.audit_table.setItem(row, 0, item_q)
-                    self.audit_table.setItem(row, 1, item_orig)
-                    self.audit_table.setItem(row, 2, item_folder)
-                    self.audit_table.setItem(row, 3, item_reason)
-
-                    btn_play_dupe = QPushButton("▶ Dupe")
-                    set_btn_variant(btn_play_dupe, "accent")
-                    btn_play_dupe.clicked.connect(
-                        lambda _, p=dest_quarantine, b=btn_play_dupe: self.play_from_table(
-                            self.audit_table, b, p, "[BLACKLISTED DUPE]"
-                        )
-                    )
-                    self.audit_table.setCellWidget(row, 4, btn_play_dupe)
-
-                    lbl_deleted = QLabel("Deleted Previously")
-                    lbl_deleted.setAlignment(Qt.AlignCenter)
-                    lbl_deleted.setStyleSheet("color: #8892b0; font-style: italic;")
-                    self.audit_table.setCellWidget(row, 5, lbl_deleted)
-
-                    btn_restore = QPushButton("↩ Restore")
-                    set_btn_variant(btn_restore, "restore")
-                    btn_restore.clicked.connect(
-                        lambda _, q_path=dest_quarantine, btn=btn_restore: self.restore_single_quarantined(q_path, btn)
-                    )
-                    self.audit_table.setCellWidget(row, 6, btn_restore)
-
-                    btn_del_one = QPushButton("✖ Delete")
-                    set_btn_variant(btn_del_one, "danger")
-                    btn_del_one.clicked.connect(
-                        lambda _, q_path=dest_quarantine, btn=btn_del_one: self.delete_single_quarantined(q_path, btn)
-                    )
-                    self.audit_table.setCellWidget(row, 7, btn_del_one)
-
-        total_isolated = quarantined_count + blacklist_caught_count
+        total_isolated = quarantined_count + metadata_caught_count + blacklist_caught_count
         if total_isolated == 0:
             self.audit_summary.setText(
-                "AUDIT COMPLETE: 0 library duplicates and 0 blacklisted tracks found! All tracks in _New_Arrivals are clean."
+                "AUDIT COMPLETE: 0 25s waveform dupes, 0 metadata/duration dupes, and 0 blacklisted tracks found!"
             )
         else:
             self.audit_summary.setText(
-                f"AUDIT COMPLETE: Isolated {quarantined_count} library dupes + {blacklist_caught_count} previously discarded tracks. "
-                f"Use '↩ Restore' on false positives, or '✖ Delete' to purge."
+                f"AUDIT COMPLETE: Isolated {quarantined_count} 25s waveform dupes + {metadata_caught_count} metadata/spectral dupes + "
+                f"{blacklist_caught_count} blacklisted tracks. Use '⇄ Replace Orig' if the new version is higher quality."
             )
 
         self.refresh_staging_table()
         self.tabs.setCurrentWidget(self.audit_tab)
+
+    def replace_original_with_quarantined(self, q_path, orig_lib_path, btn_widget):
+        """
+        Replaces the existing library track with the higher-quality duplicate from _Quarantined_Dupes.
+        Preserves or updates .m3u8 references automatically so playlists stay 100% intact.
+        """
+        if not os.path.exists(q_path):
+            QMessageBox.warning(self, "File Missing", f"Quarantined file no longer exists:\n{q_path}")
+            return
+        if not os.path.exists(orig_lib_path):
+            QMessageBox.warning(self, "Original Missing", f"Library target no longer exists:\n{orig_lib_path}")
+            return
+
+        q_fname = os.path.basename(q_path)
+        orig_fname = os.path.basename(orig_lib_path)
+        lib_dir = os.path.dirname(orig_lib_path)
+        lib_folder_name = os.path.basename(lib_dir)
+
+        if self.player.source() in (QUrl.fromLocalFile(q_path), QUrl.fromLocalFile(orig_lib_path)):
+            self.player.stop()
+
+        q_ext = os.path.splitext(q_fname)[1].lower()
+        orig_ext = os.path.splitext(orig_fname)[1].lower()
+
+        try:
+            if q_ext == orig_ext:
+                # Overwrite original file path in-place so every existing .m3u8 reference works without modification
+                shutil.move(q_path, orig_lib_path)
+                final_dest = orig_lib_path
+            else:
+                # Different audio container extension: replace file and update any .m3u8 reference
+                final_dest = os.path.join(lib_dir, os.path.splitext(orig_fname)[0] + q_ext)
+                shutil.move(q_path, final_dest)
+                if os.path.exists(orig_lib_path) and os.path.abspath(orig_lib_path) != os.path.abspath(final_dest):
+                    os.remove(orig_lib_path)
+                m3u8_p = self.find_existing_m3u8_for_playlist(lib_folder_name)
+                if os.path.exists(m3u8_p):
+                    with open(m3u8_p, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    content = content.replace(orig_fname, os.path.basename(final_dest))
+                    with open(m3u8_p, "w", encoding="utf-8") as f:
+                        f.write(content)
+
+            self.log(
+                f"[REPLACED ORIGINAL] Replaced '{lib_folder_name}/{orig_fname}' with new version '{q_fname}'!"
+            )
+
+            for r in range(self.audit_table.rowCount()):
+                if self.audit_table.cellWidget(r, 6) == btn_widget:
+                    status_item = QTableWidgetItem(f"✔ REPLACED ORIGINAL IN [{lib_folder_name}]")
+                    status_item.setForeground(QBrush(QColor("#66fcf1")))
+                    self.audit_table.setItem(r, 3, status_item)
+                    for col_i in (4, 5, 6, 7, 8):
+                        w = self.audit_table.cellWidget(r, col_i)
+                        if w:
+                            w.setEnabled(False)
+                    break
+
+            self.refresh_playlist_stats_table()
+        except Exception as e:
+            QMessageBox.critical(self, "Replace Error", f"Failed to replace original track:\n{e}")
 
     def restore_single_quarantined(self, q_path, btn_widget):
         staging = os.path.join(self.base_dir, "_New_Arrivals")
@@ -2617,16 +3174,19 @@ class MusicVaultApp(QMainWindow):
 
         if os.path.exists(q_path):
             shutil.move(q_path, dest)
-            self.log(f"[RESTORED FALSE POSITIVE] '{fname}' moved back to '_New_Arrivals/'")
+            self.log(f"[RESTORED FALSE POSITIVE] '{fname}' -> Moved back to '_New_Arrivals'")
 
-        row = self.find_row_by_widget(self.audit_table, btn_widget)
-        if row != -1:
-            self.audit_table.removeRow(row)
-
+        for r in range(self.audit_table.rowCount()):
+            if self.audit_table.cellWidget(r, 7) == btn_widget or self.audit_table.cellWidget(r, 6) == btn_widget:
+                status_item = QTableWidgetItem("↩ RESTORED TO _New_Arrivals")
+                status_item.setForeground(QBrush(QColor("#66fcf1")))
+                self.audit_table.setItem(r, 3, status_item)
+                for col_i in range(4, self.audit_table.columnCount()):
+                    w = self.audit_table.cellWidget(r, col_i)
+                    if w:
+                        w.setEnabled(False)
+                break
         self.refresh_staging_table()
-        self.audit_summary.setText(
-            f"Restored '{fname}' to _New_Arrivals. ({self.audit_table.rowCount()} items left in audit)"
-        )
 
     def delete_single_quarantined(self, q_path, btn_widget):
         fname = os.path.basename(q_path)
@@ -2635,15 +3195,18 @@ class MusicVaultApp(QMainWindow):
 
         if os.path.exists(q_path):
             os.remove(q_path)
-            self.log(f"[DELETED SINGLE DUPE] Permanently removed '{fname}' from quarantine.")
+            self.log(f"[DELETED QUARANTINED DUPE] '{fname}' permanently removed.")
 
-        row = self.find_row_by_widget(self.audit_table, btn_widget)
-        if row != -1:
-            self.audit_table.removeRow(row)
-
-        self.audit_summary.setText(
-            f"Deleted '{fname}'. ({self.audit_table.rowCount()} items left in audit)"
-        )
+        for r in range(self.audit_table.rowCount()):
+            if self.audit_table.cellWidget(r, 8) == btn_widget or self.audit_table.cellWidget(r, 7) == btn_widget:
+                status_item = QTableWidgetItem("✖ DELETED PERMANENTLY")
+                status_item.setForeground(QBrush(QColor("#ff2a54")))
+                self.audit_table.setItem(r, 3, status_item)
+                for col_i in range(4, self.audit_table.columnCount()):
+                    w = self.audit_table.cellWidget(r, col_i)
+                    if w:
+                        w.setEnabled(False)
+                break
 
     def wipe_quarantine(self):
         quarantine = os.path.join(self.base_dir, "_Quarantined_Dupes")
